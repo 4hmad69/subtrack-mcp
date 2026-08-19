@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+subscriptions.db
+categories.json
+.env
