@@ -31,24 +31,42 @@ and calendar-based cycles (monthly/quarterly/yearly) by adding real calendar
 months (so a subscription that started Jan 31st correctly lands on Feb 28th,
 not "31 days later").
 
+## Storage: Turso (hosted libSQL)
+
+Data lives in [Turso](https://turso.tech), a hosted, SQLite-compatible
+database with a free tier — not on local disk. That's a deliberate change
+from an earlier version of this project, which used a local
+`subscriptions.db` file next to `server.py`. That approach worked for local
+testing, but broke once deployed: FastMCP Cloud's filesystem is writable
+during the build step (so the table got created fine) but mounted read-only
+at runtime, so every `INSERT`/`UPDATE` failed with
+`attempt to write a readonly database`. It also wouldn't have survived a
+redeploy even without that error, since a fresh deploy means a fresh
+filesystem. Turso fixes both problems: it's reachable over HTTPS regardless
+of where the server runs, and it persists independently of any single
+deploy.
+
+Schema and SQL are unchanged from plain SQLite — only the connection layer
+changed.
+
 ## Why the tools are `async def`
 
-Every tool here is `async def`, and all SQLite access goes through
-`aiosqlite` instead of the stdlib `sqlite3`. Worth understanding *why*,
-since it's a common point of confusion:
+Every tool here is `async def`. Worth understanding *why*, since it's a
+common point of confusion — and the reasoning changed slightly with the
+Turso migration:
 
 - FastMCP already runs plain `def` tools in a thread pool by default, so a
   sync version of this server wouldn't literally freeze under light load.
-- But `async def` + a **blocking** driver (`sqlite3`) inside it is worse
-  than staying sync — FastMCP doesn't thread-offload `async def` tools (they
-  run directly on the event loop), so a blocking call inside one would stall
+- But `async def` + a **blocking** call inside it is worse than staying
+  sync — FastMCP doesn't thread-offload `async def` tools (they run
+  directly on the event loop), so a blocking call inside one would stall
   every other concurrent request.
-- So: either keep tools `def` and let the framework thread-offload them, or
-  go `async def` *and* use a genuinely async driver all the way down. This
-  server does the latter, which is the more scalable pattern for a remote
-  server that may see concurrent tool calls from multiple clients — it
-  doesn't consume a worker thread per in-flight DB call, and it composes
-  cleanly if you add other awaitable I/O later (HTTP calls, etc).
+- The `libsql` Python client is sync (it wraps HTTP calls under the hood),
+  not `async def`. So instead of calling it directly inside an `async def`
+  tool — which would block the event loop for the duration of each network
+  round trip to Turso — every DB call is wrapped in `asyncio.to_thread(...)`.
+  That preserves the same non-blocking guarantee a native async driver would
+  give, without requiring one to exist.
 - The one exception: the tiny `categories.json` read stays plain sync. It's
   a few hundred bytes read once per call — making it "async" would mean
   adding `aiofiles` for no real concurrency benefit.
@@ -58,6 +76,7 @@ since it's a common point of confusion:
 ```
 subtrack-mcp/
 ├── server.py          # the whole server — module-level `mcp` object
+├── categories.json    # subscription categories (commit this — see below)
 ├── pyproject.toml     # project metadata + deps (managed by uv)
 ├── uv.lock            # locked, reproducible dependency versions
 ├── .python-version    # pins the Python version uv uses
@@ -65,29 +84,37 @@ subtrack-mcp/
 └── README.md
 ```
 
-`categories.json` and `subscriptions.db` are **not** committed — `server.py`
-creates them automatically on first run (see `init_categories()` /
-`init_db()`). If you want your own fixed category list to survive redeploys,
-remove `categories.json` from `.gitignore` and commit your edited version.
+`categories.json` is created automatically on first run if it's missing
+(see `init_categories()`), but **commit it** rather than relying on that —
+letting it auto-generate means its one-time write is exposed to the same
+read-only-at-runtime risk that broke local SQLite. Remove it from
+`.gitignore` and commit your (possibly edited) version so it's just part of
+the deployed code, not something written at startup.
+
+There's no local database file anymore — subscription data lives entirely
+in Turso, addressed via the environment variables below.
 
 ## Run it locally (uv)
 
 No manual venv step needed — `uv run` creates and syncs `.venv` from
 `uv.lock` automatically the first time you use it.
 
-The `__main__` block in `server.py` runs the server over **HTTP** on
-`0.0.0.0:8000` by default (override with the `PORT` env var) — the same
-transport FastMCP Cloud uses in production, so local testing matches
-what you'll actually deploy:
+Local runs need the same two environment variables production does (see
+[Set up Turso](#set-up-turso-free-tier) below):
 
 ```bash
+export TURSO_DATABASE_URL="libsql://your-database.turso.io"
+export TURSO_AUTH_TOKEN="your-token"
 uv run server.py
 # Starting MCP server 'SubTrack' with transport 'http' on http://0.0.0.0:8000/mcp
 ```
 
-Note: this block only runs when you execute the file directly. FastMCP
-Cloud ignores it entirely — it imports the `mcp` object and serves it
-itself, so nothing here affects the deployed server.
+(On Windows PowerShell, use `$env:TURSO_DATABASE_URL = "..."` instead of
+`export`.)
+
+Note: the `__main__` block only runs when you execute the file directly.
+FastMCP Cloud ignores it entirely — it imports the `mcp` object and serves
+it itself, so nothing here affects the deployed server.
 
 Test it with a quick client script (`uv run python client_test.py`):
 
@@ -115,6 +142,15 @@ FastMCP CLI, which overrides the transport regardless of what's in
 uv run fastmcp run server.py:mcp --transport stdio
 ```
 
+> **Windows note:** `libsql` ships prebuilt wheels for Linux/macOS/Windows,
+> but not always for every Python version the same day it's released — if
+> `uv` starts compiling it from source (you'll see `Building libsql==...`),
+> that requires a Rust toolchain (`winget install Rustlang.Rustup`) and can
+> also fail with `Access is denied` if your project folder is inside a
+> OneDrive-synced directory, since OneDrive's file locking races with
+> Cargo's build output. Easiest fixes: run inside WSL instead (a Linux wheel
+> is available, no build needed), or move the project outside OneDrive.
+
 ### Adding or updating dependencies
 
 Don't hand-edit `pyproject.toml`'s dependency list — let uv manage it so
@@ -123,33 +159,52 @@ Don't hand-edit `pyproject.toml`'s dependency list — let uv manage it so
 ```bash
 uv add some-package             # add a new dependency
 uv add some-package --upgrade   # bump one dependency
+uv add some-package --no-sync   # update pyproject.toml/uv.lock without installing locally
 uv lock --upgrade               # re-resolve everything to latest compatible versions
 ```
 
+`--no-sync` is useful if a package needs to build from source locally (see
+the Windows note above) but you don't actually need it installed
+locally — e.g. because the real deploy target (FastMCP Cloud, Linux) has a
+prebuilt wheel and will never hit the same problem.
+
+## Set up Turso (free tier)
+
+```bash
+# Install the CLI (Linux/macOS, or inside WSL on Windows —
+# see https://docs.turso.tech/cli/installation for Windows/WSL steps)
+curl -sSfL https://get.tur.so/install.sh | bash
+turso auth login          # or `turso auth login --headless` over SSH/WSL
+
+turso db create subtrack
+turso db show subtrack --url        # → TURSO_DATABASE_URL
+turso db tokens create subtrack     # → TURSO_AUTH_TOKEN
+```
+
+Keep both values somewhere safe — you'll need them for local runs (above)
+and for the FastMCP Cloud deployment (below).
+
 ## Deploy to FastMCP Cloud
 
-1. Push this folder to a GitHub repo — commit `pyproject.toml` **and**
-   `uv.lock` (don't commit `.venv/`, that's gitignored).
-2. Sign in at [fastmcp.cloud](https://fastmcp.cloud) with GitHub and create a new project from the repo.
+1. Push this folder to a GitHub repo — commit `pyproject.toml`, `uv.lock`,
+   and `categories.json` (don't commit `.venv/`, that's gitignored).
+2. Sign in at [fastmcp.cloud](https://fastmcp.cloud) with GitHub and create
+   a new project from the repo.
 3. Set the **entrypoint** to:
    ```
    server.py:mcp
    ```
-4. Deploy. FastMCP Cloud auto-detects dependencies from `pyproject.toml`
-   (it also understands a plain `requirements.txt`, but you don't need one
-   here). You'll get a URL like `https://<project>.fastmcp.app/mcp` that any
-   MCP client — including Claude, via a custom connector — can call.
+4. In the project's environment variables settings, add:
+   - `TURSO_DATABASE_URL`
+   - `TURSO_AUTH_TOKEN`
 
-### A note on storage
+   (from [Set up Turso](#set-up-turso-free-tier) above).
+5. Deploy. FastMCP Cloud auto-detects dependencies from `pyproject.toml`.
+   You'll get a URL like `https://<project>.fastmcp.app/mcp` that any MCP
+   client — including Claude, via a custom connector — can call.
 
-This server uses SQLite on local disk for simplicity, which is great for
-learning and for a single-instance deployment. It is **not guaranteed to
-survive a redeploy** on most managed platforms (a fresh deploy usually means
-a fresh filesystem). Once you're happy with the tool logic, the natural next
-step — and a good exercise for learning remote MCP servers further — is
-swapping `sqlite3` for a hosted database (Turso/libSQL, Postgres via
-`asyncpg`, Supabase, etc.) using an environment variable for the connection
-string, set in the FastMCP Cloud dashboard (`os.getenv("DATABASE_URL")`).
+Any time you change code or dependencies, commit and push — FastMCP Cloud
+redeploys automatically on push to `main`.
 
 ## Ideas to extend it
 
