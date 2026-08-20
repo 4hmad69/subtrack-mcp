@@ -10,38 +10,59 @@ cycle, see what's about to renew, and get spend normalized to a monthly/
 yearly equivalent so weekly, quarterly, and yearly charges can be compared
 fairly.
 
-WHY ASYNC:
+STORAGE: Turso (hosted libSQL), not local SQLite
+--------------------------------------------------
+Earlier versions of this server used a local `subscriptions.db` file next to
+server.py. That works for `uv run server.py` locally, but breaks on FastMCP
+Cloud (and most managed platforms): the app's filesystem is writable during
+the build step (so init_db() succeeds and the table gets created) but
+mounted READ-ONLY at runtime, so any INSERT/UPDATE fails with "attempt to
+write a readonly database". It also wouldn't survive a redeploy even if it
+didn't error, since a fresh deploy usually means a fresh filesystem.
+
+Turso is a hosted libSQL database (a SQLite-compatible fork) with a free
+tier, reachable over HTTP/HTTPS, so it works the same whether you run this
+locally or on a stateless serverless platform. Schema and SQL are unchanged
+from plain SQLite — only the connection changes.
+
+WHY ASYNC, AND WHY to_thread HERE:
 FastMCP will happily run plain `def` tools by dispatching each call to a
 thread pool, so a sync version of this server would not technically "block"
 under light load. But for a *remote* server that may see multiple concurrent
-tool calls, real async I/O is the more correct and scalable pattern: it
-doesn't consume a worker thread per in-flight DB call, and it composes
-cleanly if you later add other awaitable I/O (HTTP calls, other async
-clients, etc). So every tool here is `async def`, and the one piece of I/O
-that matters — SQLite access — uses `aiosqlite` so the `await` is real, not
-decorative. The tiny one-time categories.json read stays plain sync (see
-note below) since making it "async" would add a dependency and complexity
-for a few milliseconds of startup I/O with no concurrency to protect.
+tool calls, real async I/O is the more correct and scalable pattern. The
+`libsql` package's remote client is sync (it wraps HTTP calls), not
+`async def`, so instead of calling it directly inside an `async def` tool
+(which WOULD block the event loop for the duration of each network round
+trip), every DB call is wrapped in `asyncio.to_thread(...)`. That keeps the
+same non-blocking guarantee the old `aiosqlite` version had, without
+requiring an async-native driver. The tiny one-time categories.json read
+stays plain sync (see note below) since making it "async" would add a
+dependency and complexity for a few milliseconds of startup I/O with no
+concurrency to protect.
 
 Deploy target: FastMCP Cloud (https://fastmcp.cloud)
   - The `mcp` object below MUST stay at module level (Cloud imports it as
     `server.py:mcp`).
   - The `if __name__ == "__main__"` block is only used for local testing;
     FastMCP Cloud ignores it and serves the `mcp` object over HTTP itself.
+  - Requires two environment variables set in the FastMCP Cloud dashboard:
+    TURSO_DATABASE_URL and TURSO_AUTH_TOKEN (see README for how to get them).
 """
 
+import asyncio
 import calendar
 import json
 import os
-import sqlite3
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-import aiosqlite
+import libsql
 from fastmcp import FastMCP
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "subscriptions.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
+
+TURSO_DATABASE_URL = os.environ["TURSO_DATABASE_URL"]
+TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
 
 mcp = FastMCP("SubTrack")
 
@@ -61,40 +82,74 @@ VALID_CYCLES = set(CYCLE_DAYS) | set(CYCLE_MONTHS) | {"custom"}
 
 
 # ---------------------------------------------------------------------------
-# Startup / storage setup — runs once at import time, before any event loop
-# is serving requests, so plain blocking sqlite3 is fine here.
+# Storage helpers
 # ---------------------------------------------------------------------------
 
+def _get_conn():
+    """Open a fresh connection to the Turso-hosted libSQL database.
+
+    One connection per call (not pooled/reused) — simplest correct thing for
+    a low-traffic personal tool. Each of these calls happens inside a worker
+    thread via asyncio.to_thread, so a short-lived connection per call also
+    avoids any cross-thread connection-sharing footguns.
+    """
+    return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+
+
+def _rows_to_dicts(cursor) -> list:
+    """DB-API 2.0 cursors don't guarantee dict-like rows, only
+    cursor.description + tuples — so build dicts from that, rather than
+    relying on a row_factory that may or may not be present."""
+    columns = [col[0] for col in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _row_to_dict(cursor, row) -> Optional[dict]:
+    if row is None:
+        return None
+    columns = [col[0] for col in cursor.description]
+    return dict(zip(columns, row))
+
+
 def init_categories():
-    """Create a default categories.json if one wasn't pushed to the repo."""
+    """Create a default categories.json if one wasn't pushed to the repo.
+
+    NOTE: commit categories.json to the repo (remove it from .gitignore)
+    instead of relying on this to create it fresh every deploy — the same
+    read-only-at-runtime issue that broke subscriptions.db applies here too,
+    this just doesn't currently trip over it because it only ever needs to
+    write once, during the build step, before the file exists.
+    """
     if not os.path.exists(CATEGORIES_PATH):
         with open(CATEGORIES_PATH, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CATEGORIES, f, indent=2)
 
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                amount REAL NOT NULL,
-                billing_cycle TEXT NOT NULL,
-                interval_days INTEGER,
-                start_date TEXT NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT '',
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_subs_active ON subscriptions(active)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_subs_category ON subscriptions(category)")
+def _init_db_sync():
+    conn = _get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            billing_cycle TEXT NOT NULL,
+            interval_days INTEGER,
+            start_date TEXT NOT NULL,
+            category TEXT NOT NULL,
+            subcategory TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_active ON subscriptions(active)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_category ON subscriptions(category)")
+    conn.commit()
+    conn.close()
 
 
 init_categories()
-init_db()
+_init_db_sync()
 
 
 # ---------------------------------------------------------------------------
@@ -199,15 +254,103 @@ def enrich(sub: dict) -> dict:
     return sub
 
 
-async def get_db():
-    """Open an aiosqlite connection with dict-like row access."""
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    return db
+# ---------------------------------------------------------------------------
+# Sync DB functions — each runs inside a worker thread via asyncio.to_thread,
+# so a slow HTTP round trip to Turso never blocks the event loop.
+# ---------------------------------------------------------------------------
+
+def _add_subscription_sync(name, amount, billing_cycle, interval_days, start_date,
+                            category, subcategory, note) -> int:
+    conn = _get_conn()
+    cur = conn.execute(
+        """INSERT INTO subscriptions
+           (name, amount, billing_cycle, interval_days, start_date, category, subcategory, note, active, created_at)
+           VALUES (?,?,?,?,?,?,?,?,1,?)""",
+        (name, amount, billing_cycle, interval_days, start_date, category, subcategory, note,
+         datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def _get_subscription_sync(id: int) -> Optional[dict]:
+    conn = _get_conn()
+    cur = conn.execute("SELECT * FROM subscriptions WHERE id = ?", (id,))
+    result = _row_to_dict(cur, cur.fetchone())
+    conn.close()
+    return result
+
+
+def _list_subscriptions_sync(active_only: bool, category: Optional[str]) -> list:
+    query = "SELECT * FROM subscriptions WHERE 1=1"
+    params = []
+    if active_only:
+        query += " AND active = 1"
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+    conn = _get_conn()
+    cur = conn.execute(query, params)
+    rows = _rows_to_dicts(cur)
+    conn.close()
+    return rows
+
+
+def _list_active_sync() -> list:
+    conn = _get_conn()
+    cur = conn.execute("SELECT * FROM subscriptions WHERE active = 1")
+    rows = _rows_to_dicts(cur)
+    conn.close()
+    return rows
+
+
+def _edit_subscription_sync(id: int, updates: dict) -> dict:
+    conn = _get_conn()
+    cur = conn.execute("SELECT category, subcategory FROM subscriptions WHERE id = ?", (id,))
+    row = _row_to_dict(cur, cur.fetchone())
+    if row is None:
+        conn.close()
+        return {"found": False, "error": None}
+
+    if "category" in updates or "subcategory" in updates:
+        check_category = updates.get("category", row["category"])
+        check_subcategory = updates.get("subcategory", row["subcategory"])
+        error = validate_category(check_category, check_subcategory)
+        if error:
+            conn.close()
+            return {"found": True, "error": error}
+
+    set_clause = ", ".join(f"{col} = ?" for col in updates)
+    values = list(updates.values()) + [id]
+    conn.execute(f"UPDATE subscriptions SET {set_clause} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+    return {"found": True, "error": None}
+
+
+def _cancel_subscription_sync(id: int) -> int:
+    conn = _get_conn()
+    cur = conn.execute("UPDATE subscriptions SET active = 0 WHERE id = ?", (id,))
+    conn.commit()
+    affected = cur.rowcount
+    conn.close()
+    return affected
+
+
+def _delete_subscription_sync(id: int) -> int:
+    conn = _get_conn()
+    cur = conn.execute("DELETE FROM subscriptions WHERE id = ?", (id,))
+    conn.commit()
+    affected = cur.rowcount
+    conn.close()
+    return affected
 
 
 # ---------------------------------------------------------------------------
-# Tools — all async def, all DB access genuinely awaited via aiosqlite
+# Tools — all async def; DB access happens via asyncio.to_thread so the
+# blocking (sync, HTTP-backed) libsql client never stalls the event loop.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -236,28 +379,20 @@ async def add_subscription(name: str, amount: float, billing_cycle: str, start_d
     if error:
         return {"status": "error", "message": error}
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """INSERT INTO subscriptions
-               (name, amount, billing_cycle, interval_days, start_date, category, subcategory, note, active, created_at)
-               VALUES (?,?,?,?,?,?,?,?,1,?)""",
-            (name, amount, billing_cycle, interval_days, start_date, category, subcategory, note,
-             datetime.utcnow().isoformat()),
-        )
-        await db.commit()
-        return {"status": "ok", "id": cur.lastrowid}
+    new_id = await asyncio.to_thread(
+        _add_subscription_sync, name, amount, billing_cycle, interval_days,
+        start_date, category, subcategory, note,
+    )
+    return {"status": "ok", "id": new_id}
 
 
 @mcp.tool()
 async def get_subscription(id: int) -> dict:
     """Get a single subscription by id, including its computed next renewal date."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM subscriptions WHERE id = ?", (id,))
-        row = await cur.fetchone()
-        if row is None:
-            return {"status": "error", "message": f"No subscription found with id {id}"}
-        return enrich(dict(row))
+    row = await asyncio.to_thread(_get_subscription_sync, id)
+    if row is None:
+        return {"status": "error", "message": f"No subscription found with id {id}"}
+    return enrich(row)
 
 
 @mcp.tool()
@@ -266,19 +401,8 @@ async def list_subscriptions(active_only: bool = True, category: Optional[str] =
     List subscriptions, each enriched with next_renewal, days_until_renewal, and
     monthly_equivalent cost. Sorted by soonest renewal first.
     """
-    query = "SELECT * FROM subscriptions WHERE 1=1"
-    params = []
-    if active_only:
-        query += " AND active = 1"
-    if category:
-        query += " AND category = ?"
-        params.append(category)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(query, params)
-        rows = [enrich(dict(r)) for r in await cur.fetchall()]
-
+    rows = await asyncio.to_thread(_list_subscriptions_sync, active_only, category)
+    rows = [enrich(r) for r in rows]
     rows.sort(key=lambda r: r["next_renewal"])
     return rows
 
@@ -298,33 +422,20 @@ async def edit_subscription(id: int, name: Optional[str] = None, amount: Optiona
     if not updates:
         return {"status": "error", "message": "No fields provided to update"}
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT category, subcategory FROM subscriptions WHERE id = ?", (id,))
-        row = await cur.fetchone()
-        if row is None:
-            return {"status": "error", "message": f"No subscription found with id {id}"}
+    if "billing_cycle" in updates and updates["billing_cycle"] not in VALID_CYCLES:
+        return {"status": "error", "message": f"Invalid billing_cycle. Valid: {', '.join(sorted(VALID_CYCLES))}"}
 
-        if "billing_cycle" in updates and updates["billing_cycle"] not in VALID_CYCLES:
-            return {"status": "error", "message": f"Invalid billing_cycle. Valid: {', '.join(sorted(VALID_CYCLES))}"}
+    if "start_date" in updates:
+        try:
+            parse_date(updates["start_date"])
+        except ValueError:
+            return {"status": "error", "message": "start_date must be in YYYY-MM-DD format"}
 
-        if "start_date" in updates:
-            try:
-                parse_date(updates["start_date"])
-            except ValueError:
-                return {"status": "error", "message": "start_date must be in YYYY-MM-DD format"}
-
-        if "category" in updates or "subcategory" in updates:
-            check_category = updates.get("category", row["category"])
-            check_subcategory = updates.get("subcategory", row["subcategory"])
-            error = validate_category(check_category, check_subcategory)
-            if error:
-                return {"status": "error", "message": error}
-
-        set_clause = ", ".join(f"{col} = ?" for col in updates)
-        values = list(updates.values()) + [id]
-        await db.execute(f"UPDATE subscriptions SET {set_clause} WHERE id = ?", values)
-        await db.commit()
+    result = await asyncio.to_thread(_edit_subscription_sync, id, updates)
+    if not result["found"]:
+        return {"status": "error", "message": f"No subscription found with id {id}"}
+    if result["error"]:
+        return {"status": "error", "message": result["error"]}
 
     return {"status": "ok", "id": id, "updated_fields": list(updates.keys())}
 
@@ -333,32 +444,26 @@ async def edit_subscription(id: int, name: Optional[str] = None, amount: Optiona
 async def cancel_subscription(id: int) -> dict:
     """Mark a subscription as cancelled (soft delete) so it stops showing as active
     but stays in history for reporting."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("UPDATE subscriptions SET active = 0 WHERE id = ?", (id,))
-        await db.commit()
-        if cur.rowcount == 0:
-            return {"status": "error", "message": f"No subscription found with id {id}"}
+    affected = await asyncio.to_thread(_cancel_subscription_sync, id)
+    if affected == 0:
+        return {"status": "error", "message": f"No subscription found with id {id}"}
     return {"status": "ok", "cancelled_id": id}
 
 
 @mcp.tool()
 async def delete_subscription(id: int) -> dict:
     """Permanently delete a subscription record."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM subscriptions WHERE id = ?", (id,))
-        await db.commit()
-        if cur.rowcount == 0:
-            return {"status": "error", "message": f"No subscription found with id {id}"}
+    affected = await asyncio.to_thread(_delete_subscription_sync, id)
+    if affected == 0:
+        return {"status": "error", "message": f"No subscription found with id {id}"}
     return {"status": "ok", "deleted_id": id}
 
 
 @mcp.tool()
 async def upcoming_renewals(days: int = 7) -> list:
     """List active subscriptions renewing within the next N days (default 7), soonest first."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM subscriptions WHERE active = 1")
-        rows = [enrich(dict(r)) for r in await cur.fetchall()]
+    rows = await asyncio.to_thread(_list_active_sync)
+    rows = [enrich(r) for r in rows]
 
     upcoming = [r for r in rows if 0 <= r["days_until_renewal"] <= days]
     upcoming.sort(key=lambda r: r["days_until_renewal"])
@@ -373,10 +478,8 @@ async def spending_summary(by: str = "category") -> dict:
 
     by: "category" groups totals by category, "all" returns just the grand total.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM subscriptions WHERE active = 1")
-        rows = [enrich(dict(r)) for r in await cur.fetchall()]
+    rows = await asyncio.to_thread(_list_active_sync)
+    rows = [enrich(r) for r in rows]
 
     grand_total = round(sum(r["monthly_equivalent"] for r in rows), 2)
 
