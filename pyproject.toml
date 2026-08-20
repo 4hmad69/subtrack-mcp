@@ -5,6 +5,6 @@ description = "MCP server for tracking recurring subscriptions and bills"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "aiosqlite>=0.22.1",
     "fastmcp>=3.4.7",
+    "libsql>=0.1.11",
 ]
