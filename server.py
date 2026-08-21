@@ -477,15 +477,6 @@ def renewal_digest_prompt(days: int = 7) -> str:
 
 
 if __name__ == "__main__":
-    # Local / self-hosted testing only. FastMCP Cloud ignores this block
-    # entirely — it imports the `mcp` object directly and serves it over
-    # HTTP itself, so nothing here affects the Cloud deployment.
-    #
-    # It DOES matter if you run this file yourself (`uv run server.py`) or
-    # ever self-host outside FastMCP Cloud (Docker, a VPS, Cloud Run, etc.):
-    # host="0.0.0.0" makes the server reachable from outside the container/
-    # machine (127.0.0.1 would only accept connections from itself), and
-    # reading PORT from the environment matches how most hosts (Cloud Run,
-    # Render, Fly, etc.) tell your process which port to bind.
+    
     port = int(os.environ.get("PORT", 8000))
     mcp.run(transport="http", host="0.0.0.0", port=port)
